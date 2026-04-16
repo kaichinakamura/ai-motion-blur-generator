@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ai-motion-blur-generator"
-version = "0.1.0"
+version = "0.1.0-mvp"
 dependencies = [
  "serde",
  "serde_json",
