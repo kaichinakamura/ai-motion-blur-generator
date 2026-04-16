@@ -1,0 +1,21 @@
+[project]
+name = "motion-blur-core"
+version = "0.1.0"
+description = "AI-powered motion blur generator core - RIFE interpolation & blending"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "pillow>=10.0",
+]
+
+[project.scripts]
+motion-blur-core = "motion_blur_core.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
