@@ -1,11 +1,13 @@
 import os
 import subprocess
 import tempfile
-import sys
 import shutil
 import cv2
+import torch
 import numpy as np
 from .rife import RIFEModel
+from .vector_blur import VectorBlurEngine
+from .optical_flow import OpticalFlowExtractor
 
 def extract_frames(video_path, out_dir):
     cmd = [
@@ -27,17 +29,17 @@ def get_fps(video_path):
     num, den = result.stdout.strip().split('/')
     return float(num) / float(den)
 
-def process_video(input_path, output_path, shutter_angle=180.0, progress_cb=None):
-    if progress_cb: progress_cb(0, "Initializing RIFE on PyTorch (MPS)")
+def process_video(input_path, output_path, shutter_angle=180.0, use_rife=False, flow_resolution=720, progress_cb=None, cancel_event=None):
+    if progress_cb: progress_cb(0, "Initializing ML Models on PyTorch (MPS)")
     
-    rife = RIFEModel(device="mps")
-    
-    factor = 8 # interpolate up to 8x
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    rife = RIFEModel(device=device) if use_rife else None
+    vblur = VectorBlurEngine(device=device)
+    flow_ext = OpticalFlowExtractor(device=device)
     
     temp_dir = tempfile.mkdtemp()
     extracted_dir = os.path.join(temp_dir, "extracted")
     os.makedirs(extracted_dir, exist_ok=True)
-    
     blurred_dir = os.path.join(temp_dir, "blurred")
     os.makedirs(blurred_dir, exist_ok=True)
     
@@ -47,44 +49,78 @@ def process_video(input_path, output_path, shutter_angle=180.0, progress_cb=None
         num_frames = len(frames)
         fps = get_fps(input_path)
         
-        if progress_cb: progress_cb(15, "Starting AI frame interpolation")
+        if progress_cb: progress_cb(15, "Starting Hybrid Vector Blur pipeline")
         
-        # Compute subframes to blend based on shutter_angle
-        # 360 deg = factor frames. 180 deg = factor/2 frames.
-        use_factor = max(1, int(factor * (shutter_angle / 360.0)))
+        if use_rife:
+            factor = 4
+            use_factor = max(1, int(factor * (shutter_angle / 360.0)))
+        else:
+            factor = 1
+            use_factor = 1
         
         for i in range(num_frames - 1):
-            img1 = cv2.imread(frames[i])
-            img2 = cv2.imread(frames[i+1])
-            
-            subframes = []
-            for j in range(factor):
-                ratio = j / factor
-                interp = rife.interpolate(img1, img2, ratio)
-                subframes.append(interp)
+            if cancel_event and cancel_event.is_set():
+                break
                 
-            # Blending (Weighted averaging of the subframes)
-            start_idx = (factor - use_factor) // 2
-            end_idx = start_idx + use_factor
+            img1_bgr = cv2.imread(frames[i])
+            img2_bgr = cv2.imread(frames[i+1])
             
-            blend_frames = subframes[start_idx:end_idx]
-            if len(blend_frames) == 0:
-                blend_frames = [subframes[0]]
+            if use_rife:
+                subframes_bgr = []
+                for j in range(factor):
+                    ratio = j / factor
+                    interp = rife.interpolate(img1_bgr, img2_bgr, ratio)
+                    subframes_bgr.append(interp)
+                subframes_bgr.append(img2_bgr)
+                start_idx = (factor - use_factor) // 2
+                end_idx = start_idx + use_factor
+            else:
+                subframes_bgr = [img1_bgr, img2_bgr]
+                start_idx = 0
+                end_idx = 1
+            
+            blend_tensors = []
+            
+            for j in range(start_idx, end_idx):
+                sf_curr = subframes_bgr[j]
+                sf_next = subframes_bgr[j+1]
                 
-            avg_img = blend_frames[0].astype(float)
-            for b in blend_frames[1:]:
-                avg_img += b.astype(float)
-            avg_img /= len(blend_frames)
+                # Convert BGR -> RGB -> Tensor [1, 3, H, W]
+                sf_curr_rgb = cv2.cvtColor(sf_curr, cv2.COLOR_BGR2RGB)
+                sf_next_rgb = cv2.cvtColor(sf_next, cv2.COLOR_BGR2RGB)
+                
+                curr_t = torch.from_numpy(sf_curr_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
+                next_t = torch.from_numpy(sf_next_rgb).permute(2, 0, 1).float().unsqueeze(0).to(device) / 255.0
+                
+                # 1. Optical Flow extraction
+                # flow represents vector from curr -> next
+                calc_res = flow_resolution if flow_resolution > 0 else 999999
+                flow = flow_ext.compute_flow(curr_t, next_t, max_size=calc_res)
+                
+                # 2. Vector Blur
+                current_shutter = 360.0 if use_rife else shutter_angle
+                samples = 11 if use_rife else 25
+                blurred_t = vblur.apply_vector_blur(curr_t, flow, shutter_angle=current_shutter, num_samples=samples)
+                blend_tensors.append(blurred_t)
+                
+            # 3. Combine subframes
+            if use_rife and len(blend_tensors) > 1:
+                avg_t = torch.mean(torch.stack(blend_tensors, dim=0), dim=0) # [1, 3, H, W]
+            else:
+                avg_t = blend_tensors[0]
             
-            out_img = avg_img.astype(np.uint8)
+            # Output Numpy back to disk
+            out_img_rgb = (avg_t.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            out_img_bgr = cv2.cvtColor(out_img_rgb, cv2.COLOR_RGB2BGR)
+            
             out_file = os.path.join(blurred_dir, f"{i:08d}.jpg")
-            cv2.imwrite(out_file, out_img)
+            cv2.imwrite(out_file, out_img_bgr)
             
-            if progress_cb and i % max(1, (num_frames // 20)) == 0:
-                p = 15 + 75 * (i / num_frames)
-                progress_cb(int(p), f"Interpolating and blending ({i}/{num_frames})")
+            if progress_cb:
+                p = 15 + 75 * (i / max(1, num_frames - 2))
+                progress_cb(int(p), f"Vector Blurring ({i+1}/{num_frames-1})")
                 
-        # Handle last frame
+        # Last frame
         if num_frames > 0:
             shutil.copy(frames[-1], os.path.join(blurred_dir, f"{num_frames-1:08d}.jpg"))
             

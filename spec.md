@@ -1,7 +1,8 @@
-# Project: AI Motion Blur Generator (MVP)
+# Project: AI Motion Blur Generator - Version 0.2.0-dev
 
 ## 1. プロジェクト概要
-高フレームレートで撮影された動画に対し、AI（RIFE）によるフレーム補間とブレンディング技術を用いて、物理的に正しい「モーションブラー」を後付けするMac用デスクトップアプリ。
+高フレームレート動画に対し、AIによるフレーム補間と**オプティカルフロー・ベクトルブラー**を組み合わせて、シネマチックなモーションブラーを後付けするMac用デスクトップアプリ。
+**※重要：単純なフレーム蓄積（Accumulation）によるゴースト現象を排除し、移動ベクトルに基づいたピクセル引き延ばしによる滑らかな質感を追求する。**
 
 ## 2. 技術スタック
 ### Frontend (GUI)
@@ -14,47 +15,41 @@
 ### Backend (AI Core / Sidecar)
 - **Language:** Python 3.10+
 - **Package Manager:** `uv` (高速かつクリーンな環境管理)
-- **AI Model:** RIFE (Real-Time Intermediate Flow Estimation)
 - **ML Framework:** PyTorch (Apple Siliconの **MPS: Metal Performance Shaders** を使用)
+- **Models:**
+    - **RIFE:** 低倍率（2x〜4x）のフレーム補間に使用。
+    - **Optical Flow:** RIFEの内部フロー、またはRAFT等を用いて移動ベクトル $V(x, y)$ を抽出。
 - **Video Engine:** FFmpeg (フレーム分解、再合成、音声保持)
 
-### Distribution
-- **Output:** macOS Native Application (.app)
-
 ## 3. 画面仕様 (UI/UX)
-1. **入力エリア:**
-   - 画面中央に大きなD&Dエリア。「またはファイルを選択」ボタンでFinder起動。
+1. **入力エリア:** 画面中央にD&Dエリア。
 2. **ブラー設定:**
    - **Shutter Angle (Slider/Input):** 0° 〜 360° (デフォルト 180°)。
-3. **出力設定 (Export Settings):**
-   - **Format:** Dropdown (.mp4, .mov)
-   - **Resolution:** Input/Dropdown (Original, 1080p, 4K等)
-   - **Bitrate:** Input (Mbps)
-4. **進行状況:**
-   - プログレスバーと現在のステータス表示（例: "AI補間中...", "レンダリング中..."）
+   - ※この値がフローベクトルの「引き延ばし強度」を決定する。
+3. **出力設定:** Format (.mp4, .mov), Resolution, Bitrate。
+4. **進行状況:** プログレスバーと「フロー計算中」「ベクトル合成中」等のステータス表示。
 
-## 4. 処理ロジック (コア仕様)
+## 4. 処理ロジック (コア仕様：ハイブリッド方式)
 ### Step 1: フレーム分解
 FFmpegを使用して、入力動画を連番画像に分解する。
 
-### Step 2: フレーム補間 (AI)
-RIFEを用いて、オリジナルフレーム間に中間フレームを生成する。
-- 補間倍率: 固定（例: 8倍）またはシャッターアングルに応じて動的に決定。
+### Step 2: AIフレーム補間 (Pre-Interpolation)
+RIFEを用いて、オリジナルフレーム間を **2倍〜4倍** に補間する。
+- **目的:** 大きな動きによるフロー推定の破綻を抑制し、重なり（オクルージョン）境界を滑らかにするため。
 
-### Step 3: モーションブラー合成 (Weighted Blending)
-指定されたシャッターアングルに基づき、補間されたサブフレームを積算・平均化して1枚の「ブラー付きフレーム」を生成する。
-- **計算式:** シャッターアングルが $180^\circ$ の場合、1フレーム分の時間のうち前後の $50\%$ に相当するサブフレームのみを合成に使用する。
+### Step 3: オプティカルフローの抽出
+補間された各フレーム間でピクセルごとの移動ベクトル $V(x, y)$ を計算する。
+- Apple Silicon (MPS) 上で高速に処理すること。
 
-### Step 4: 動画結合
+### Step 4: 方向性ベクトル・ブラー (Vector Blur)
+各フレームに対し、フローベクトルに基づいたブラーを適用する。
+- **計算式:** 各ピクセルをベクトル $V \times (ShutterAngle / 360)$ の方向に引き延ばす。
+- **実装方法:** PyTorch の `grid_sample` を活用。ベクトルの線上で複数のサンプル点（例: 7〜15点）をサンプリングし、加重平均を行う。これにより、サンプル不足による「二重像」を完全に排除し、滑らかな「筋」状のボケを作る。
+
+### Step 5: 動画結合
 合成された連番画像をFFmpegで結合。元の動画から音声を抽出し、同期させて最終出力ファイルを作成する。
 
-## 5. 開発環境の構築方針 (Antigravityへの指示)
-1. **Tauriプロジェクトの初期化:** `pnpm create tauri-app`
-2. **Python Sidecarのセットアップ:** - `src-tauri/bin/python` ディレクトリを作成。
-   - `uv` を使用して、`torch` (MPS対応), `opencv-python`, `ffmpeg-python` を含む実行環境を構築。
-3. **通信プロトコル:**
-   - Tauri (Rust) から Python Sidecar を `Command` API経由で呼び出し、JSON形式で進捗をフロントエンドに通知する。
-
-## 6. 注意事項
-- **Apple Silicon最適化:** `torch.device("mps")` を明示的に使用すること。
-- **メモリ管理:** 4K動画処理時にVRAM（共有メモリ）が不足しないよう、フレーム単位またはタイル単位での処理を検討すること。
+## 5. 開発環境・実装方針
+1. **MPS最適化:** `torch.device("mps")` を使用。`grid_sample` 等のテンソル演算をGPUで行う。
+2. **メモリ管理:** 4K動画処理を考慮し、全サブフレームを一度にメモリに載せない「ストリーム処理（1フレームずつ生成・保存）」を徹底する。
+3. **通信プロトコル:** Tauri (Rust) から Python Sidecar を `Command` API経由で呼び出し、進捗をJSON形式でフロントエンドに通知する。
