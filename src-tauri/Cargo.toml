@@ -1,6 +1,6 @@
 [package]
 name = "ai-motion-blur-generator"
-version = "0.1.0"
+version = "0.1.0-mvp"
 description = "AI-powered motion blur generator for high frame rate videos"
 authors = ["you"]
 edition = "2021"
