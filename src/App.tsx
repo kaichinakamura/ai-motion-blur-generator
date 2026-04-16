@@ -9,6 +9,8 @@ function App() {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [outPath, setOutPath] = useState<string | null>(null);
   const [shutterAngle, setShutterAngle] = useState<number>(180);
+  const [useRife, setUseRife] = useState<boolean>(false);
+  const [flowResolution, setFlowResolution] = useState<number>(720);
   const [format, setFormat] = useState<string>(".mp4");
 
   const [isProcessing, setIsProcessing] = useState(false);
@@ -105,7 +107,9 @@ function App() {
         command: "process",
         input: filePath,
         output: finalOut,
-        shutter_angle: shutterAngle
+        shutter_angle: shutterAngle,
+        use_rife: useRife,
+        flow_resolution: flowResolution
       });
 
       await invoke("start_processing", { inputJson: payload });
@@ -177,6 +181,37 @@ function App() {
             }}
             disabled={isProcessing}
           />
+        </div>
+
+        <div className="setting-group" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
+          <input
+            type="checkbox"
+            id="useRife"
+            checked={useRife}
+            onChange={(e) => {
+              setUseRife(e.target.checked);
+              setOutPath(null);
+            }}
+            disabled={isProcessing}
+          />
+          <label htmlFor="useRife" style={{ cursor: 'pointer', margin: 0, padding: 0 }}>Use AI Interpolation (May cause ghosting)</label>
+        </div>
+
+        <div className="setting-group" style={{ marginBottom: '1rem' }}>
+          <label>Optical Flow Precision (Speed vs Accuracy)</label>
+          <select
+            value={flowResolution}
+            onChange={(e) => {
+              setFlowResolution(parseInt(e.target.value));
+              setOutPath(null);
+            }}
+            disabled={isProcessing}
+          >
+            <option value={480}>Fast (480p)</option>
+            <option value={720}>Balanced (720p) - Default</option>
+            <option value={1080}>High Quality (1080p)</option>
+            <option value={0}>Native (Original Size, Very Slow!)</option>
+          </select>
         </div>
 
         <div className="setting-group">
